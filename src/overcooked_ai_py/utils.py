@@ -1,4 +1,4 @@
-import io, json, pickle, pstats, cProfile, os
+import io, json, pickle, pstats, cProfile, os, tempfile, uuid, inspect  
 import numpy as np
 from numpy import nan
 from collections import defaultdict
@@ -38,6 +38,11 @@ def load_from_json(filename):
     with open(fix_filetype(filename, ".json"), "r") as json_file:
         return json.load(json_file)
 
+def load_text_file(filename):
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+        return "".join(lines)
+
 def iterate_over_json_files_in_dir(dir_path):
     pathlist = Path(dir_path).glob("*.json")
     return [str(path) for path in pathlist]
@@ -47,6 +52,14 @@ def fix_filetype(path, filetype):
         return path
     else:
         return path + filetype
+
+def generate_temporary_file_path(file_name=None, prefix="", suffix="", extension=""):
+    if file_name is None:
+        file_name = str(uuid.uuid1())
+    if extension and not extension.startswith("."):
+        extension = "." + extension
+    file_name = prefix + file_name + suffix + extension
+    return os.path.join(tempfile.gettempdir(), file_name)
 
 # MDP
 
@@ -166,8 +179,51 @@ def profile(fnc):
         return retval
     return inner
 
+def numpy_to_native(x):
+    if isinstance(x, np.generic):
+        return x.item()
+    else:
+        return x
+
+class NumpyArrayEncoder(json.JSONEncoder):
+    # code taken from https://pynative.com/python-serialize-numpy-ndarray-into-json
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NumpyArrayEncoder, self).default(obj)
+
 def read_layout_dict(layout_name):
     return load_dict_from_file(os.path.join(LAYOUTS_DIR, layout_name + ".layout"))
 
+class classproperty(property):
+    def __get__(self, cls, owner):
+        return classmethod(self.fget).__get__(None, owner)()
+
 def is_iterable(obj):
     return isinstance(obj, Iterable)
+
+# based on code from https://stackoverflow.com/questions/480214/how-do-you-remove-duplicates-from-a-list-whilst-preserving-order
+def delete_duplicates(seq):
+    seen = set()
+    seen_add = seen.add
+    def serialize_if_dict_or_list(d):
+        if isinstance(d, list) or isinstance(d, dict):
+            return json.dumps(d, sort_keys=True)
+        else:
+            return d
+    return [x for x in seq if not (serialize_if_dict_or_list(x) in seen or seen_add(serialize_if_dict_or_list(x)))]
+
+def only_valid_named_args(kwargs, function, kwargs_accepted=True):
+    """returns trimmed kwargs out of arguments that are not in function argument names
+    if kwargs accepted=True and function accept **kwargs then pass any named arguments
+    """
+    arg_names, var_args_name, kwargs_name, defaults = inspect.getargspec(function)
+    if kwargs_name and kwargs_accepted:
+        return kwargs
+    else:
+        return {k:v for k,v in kwargs.items() if k in arg_names}

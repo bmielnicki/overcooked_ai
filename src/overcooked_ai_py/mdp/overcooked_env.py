@@ -1,7 +1,7 @@
 import gym, tqdm
 import time
 import numpy as np
-from overcooked_ai_py.utils import mean_and_std_err, append_dictionaries
+from overcooked_ai_py.utils import mean_and_std_err, append_dictionaries, only_valid_named_args
 from overcooked_ai_py.mdp.actions import Action
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld, EVENT_TYPES
 from overcooked_ai_py.planning.planners import MediumLevelActionManager, MotionPlanner, NO_COUNTERS_PARAMS
@@ -93,8 +93,11 @@ class OvercookedEnv(object):
     @property
     def mp(self):
         if self._mp is None:
-            self._mp = MotionPlanner.from_pickle_or_compute(self.mdp, self.mlam_params["counter_goals"],
-                                                            force_compute=False)
+            if self._mlam is not None:
+                self._mp = self.mlam.motion_planner
+            else:
+                self._mp = MotionPlanner.from_pickle_or_compute(self.mdp, self.mlam_params["counter_goals"],
+                                                                force_compute=False)
         return self._mp
 
     @staticmethod
@@ -114,6 +117,11 @@ class OvercookedEnv(object):
             num_mdp=1
         )
 
+    @staticmethod
+    def from_trajectories_json(trajs, idx=0):
+        mdp = OvercookedGridworld(**trajs["mdp_params"][idx])
+        env_params = only_valid_named_args(trajs["env_params"][idx], OvercookedEnv.from_mdp) 
+        return OvercookedEnv.from_mdp(mdp, **env_params)
 
     #####################
     # BASIC CLASS UTILS #
@@ -123,7 +131,7 @@ class OvercookedEnv(object):
     def env_params(self):
         """
         Env params should be though of as all of the params of an env WITHOUT the mdp.
-        Alone, env_params is not sufficent to recreate a copy of the Env instance, but it is
+        Alone, env_params is not sufficient to recreate a copy of the Env instance, but it is
         together with mdp_params (which is sufficient to build a copy of the Mdp instance).
         """
         return {
@@ -140,7 +148,8 @@ class OvercookedEnv(object):
             start_state_fn=self.start_state_fn,
             horizon=self.horizon,
             info_level=self.info_level,
-            num_mdp=self.num_mdp
+            num_mdp=self.num_mdp,
+            mlam_params=self.mlam_params
         )
 
 
@@ -223,8 +232,7 @@ class OvercookedEnv(object):
         
         if done: self._add_episode_info(env_info)
 
-        timestep_sparse_reward = sum(mdp_infos["sparse_reward_by_agent"])
-        return (next_state, timestep_sparse_reward, done, env_info)
+        return (next_state, mdp_infos["sparse_reward_sum"], done, env_info)
 
     def lossless_state_encoding_mdp(self, state):
         """
@@ -236,7 +244,7 @@ class OvercookedEnv(object):
         """
         Wrapper of the mdp's featurize_state
         """
-        return self.mdp.featurize_state(state, self.horizon, self.mlam)
+        return self.mdp.featurize_state(state, self.mlam, self.horizon)
 
     def reset(self, regen_mdp=True, outside_info={}):
         """
@@ -261,9 +269,12 @@ class OvercookedEnv(object):
         events_dict = { k : [ [] for _ in range(self.mdp.num_players) ] for k in EVENT_TYPES }
         rewards_dict = {
             "cumulative_sparse_rewards_by_agent": np.array([0] * self.mdp.num_players),
-            "cumulative_shaped_rewards_by_agent": np.array([0] * self.mdp.num_players)
+            "cumulative_shaped_rewards_by_agent": np.array([0] * self.mdp.num_players),
+            "cumulative_sparse_env_rewards": np.array([0]),
+            "cumulative_sparse_rewards_sum": np.array([0])
         }
         self.game_stats = {**events_dict, **rewards_dict}
+        self.events_list = []
 
     def is_done(self):
         """Whether the episode is over."""
@@ -292,6 +303,8 @@ class OvercookedEnv(object):
         # TODO: This can be further simplified by having all the mdp_infos copied over to the env_infos automatically 
         env_info["sparse_r_by_agent"] = mdp_infos["sparse_reward_by_agent"]
         env_info["shaped_r_by_agent"] = mdp_infos["shaped_reward_by_agent"]
+        env_info["sparse_r_sum"] = mdp_infos["sparse_reward_sum"]
+        env_info["sparse_env_r"] = mdp_infos["sparse_env_reward"]
         env_info["phi_s"] = mdp_infos["phi_s"] if "phi_s" in mdp_infos else None
         env_info["phi_s_prime"] = mdp_infos["phi_s_prime"] if "phi_s_prime" in mdp_infos else None
         return env_info
@@ -299,8 +312,10 @@ class OvercookedEnv(object):
     def _add_episode_info(self, env_info):
         env_info["episode"] = {
             "ep_game_stats": self.game_stats,
+            "events_list": self.events_list,
             "ep_sparse_r": sum(self.game_stats["cumulative_sparse_rewards_by_agent"]),
             "ep_shaped_r": sum(self.game_stats["cumulative_shaped_rewards_by_agent"]),
+            "ep_sparse_env_r": sum(self.game_stats["cumulative_sparse_env_rewards"]),
             "ep_sparse_r_by_agent": self.game_stats["cumulative_sparse_rewards_by_agent"],
             "ep_shaped_r_by_agent": self.game_stats["cumulative_shaped_rewards_by_agent"],
             "ep_length": self.state.timestep
@@ -314,6 +329,8 @@ class OvercookedEnv(object):
         """
         self.game_stats["cumulative_sparse_rewards_by_agent"] += np.array(infos["sparse_reward_by_agent"])
         self.game_stats["cumulative_shaped_rewards_by_agent"] += np.array(infos["shaped_reward_by_agent"])
+        self.game_stats["cumulative_sparse_env_rewards"] += np.array(infos["sparse_env_reward"])
+        self.game_stats["cumulative_sparse_rewards_sum"] += np.array([infos["sparse_reward_sum"]])
 
         for event_type, bool_list_by_agent in infos["event_infos"].items():
             # For each event type, store the timestep if it occurred
@@ -321,7 +338,10 @@ class OvercookedEnv(object):
             for idx, event_by_agent in enumerate(event_occurred_by_idx):
                 if event_by_agent:
                     self.game_stats[event_type][idx].append(self.state.timestep)
-
+        
+        for event in infos["events_list"]:
+            event["timestep"] = self.state.timestep
+            self.events_list.append(event)
 
     ####################
     # TRAJECTORY LOGIC #
@@ -378,7 +398,7 @@ class OvercookedEnv(object):
         if include_final_state:
             trajectory.append((s_tp1, (None, None), 0, True, None))
 
-        total_sparse = sum(self.game_stats["cumulative_sparse_rewards_by_agent"])
+        total_sparse = sum(self.game_stats["cumulative_sparse_rewards_sum"])
         total_shaped = sum(self.game_stats["cumulative_shaped_rewards_by_agent"])
         return np.array(trajectory), self.state.timestep, total_sparse, total_shaped
 

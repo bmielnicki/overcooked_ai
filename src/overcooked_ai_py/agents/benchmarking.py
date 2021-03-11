@@ -1,14 +1,16 @@
-import copy
+import copy, json
 import numpy as np
-from IPython.display import display
 
 from overcooked_ai_py.utils import save_pickle, load_pickle, cumulative_rewards_from_rew_list, save_as_json, \
-    load_from_json, merge_dictionaries, rm_idx_from_dict, take_indexes_from_dict, is_iterable
+    load_from_json, merge_dictionaries, rm_idx_from_dict, take_indexes_from_dict, is_iterable, NumpyArrayEncoder
 from overcooked_ai_py.planning.planners import NO_COUNTERS_PARAMS
 from overcooked_ai_py.agents.agent import AgentPair, RandomAgent, GreedyHumanModel
-from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld, Action, OvercookedState
+from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld, Action, OvercookedState, Recipe
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.mdp.layout_generator import LayoutGenerator
+from overcooked_ai_py.visualization.extract_events import extract_events
+from overcooked_ai_py.visualization.visualization_utils import run_html_in_ipython, run_html_in_web, \
+    create_chart_html, DEFAULT_EVENT_CHART_SETTINGS
 
 
 class AgentEvaluator(object):
@@ -30,7 +32,9 @@ class AgentEvaluator(object):
         debug (bool): whether to display debugging information on init
         """
         assert callable(mdp_fn), "mdp generating function must be a callable function"
-        env_params["mlam_params"] = mlam_params
+        if env_params.get("mlam_params") is None:
+            env_params = copy.deepcopy(env_params)
+            env_params["mlam_params"] = mlam_params
         self.mdp_fn = mdp_fn
         self.env = OvercookedEnv(self.mdp_fn, **env_params)
         self.force_compute = force_compute
@@ -124,11 +128,11 @@ class AgentEvaluator(object):
     def evaluate_agent_pair(self, agent_pair, num_games, game_length=None, start_state_fn=None, metadata_fn=None, metadata_info_fn=None, display=False, dir=None,
                             display_phi=False, info=True, native_eval=False):
         # this index has to be 0 because the Agent_Evaluator only has 1 env initiated
-        # if you would like to evaluate on a different env using rllib, please modifiy
+        # if you would like to evaluate on a different env using rllib, please modify
         # rllib/ -> rllib.py -> get_rllib_eval_function -> _evaluate
 
         # native eval: using self.env in evaluation instead of creating a copy
-        # this is particulally helpful with variable MDP, where we want to make sure
+        # this is particularly helpful with variable MDP, where we want to make sure
         # the mdp used in evaluation is the same as the native self.env.mdp
         if native_eval:
             return self.env.get_rollouts(agent_pair, num_games=num_games, display=display, dir=dir, display_phi=display_phi,
@@ -187,11 +191,14 @@ class AgentEvaluator(object):
             print("Skipping trajectory consistency checking because MDP was recognized as variable. "
                   "Trajectory consistency checking is not yet supported for variable MDPs.")
             return
-
+        
         _, envs = AgentEvaluator.get_mdps_and_envs_from_trajectories(trajectories)
 
         for idx in range(len(trajectories["ep_states"])):
             states, actions, rewards = trajectories["ep_states"][idx], trajectories["ep_actions"][idx], trajectories["ep_rewards"][idx]
+            if states[0].orders_list.is_adding_orders and len(states[0].orders_list.orders_to_add) > 1:
+                print("Skipping trajectory consistency checking for idx %i because orders are added at random" % idx)
+                return
             simulation_env = envs[idx]
 
             assert len(states) == len(actions) == len(rewards), "# states {}\t# actions {}\t# rewards {}".format(
@@ -205,7 +212,7 @@ class AgentEvaluator(object):
 
                 next_state, reward, done, info = simulation_env.step(actions[i])
 
-                assert states[i + 1] == next_state, "States differed (expected vs actual): {}\n\nexpected dict: \t{}\nactual dict: \t{}".format(
+                assert states[i + 1].ids_independent_equal(next_state), "States differed (expected vs actual): {}\n\nexpected dict: \t{}\nactual dict: \t{}".format(
                     simulation_env.display_states(states[i + 1], next_state), states[i+1].to_dict(), next_state.to_dict()
                 )
                 assert rewards[i] == reward, "{} \t {}".format(rewards[i], reward)
@@ -228,64 +235,25 @@ class AgentEvaluator(object):
     @staticmethod
     def save_trajectories(trajectories, filename):
         AgentEvaluator.check_trajectories(trajectories)
-        if any(t["env_params"]["start_state_fn"] is not None for t in trajectories):
+        if any(env_params["start_state_fn"] is not None for env_params in trajectories["env_params"]):
             print("Saving trajectories with a custom start state. This can currently "
                   "cause things to break when loading in the trajectories.")
         save_pickle(trajectories, filename)
 
+
     @staticmethod
     def load_trajectories(filename):
+        AgentEvaluator._configure_recipe_if_needed()
         trajs = load_pickle(filename)
         AgentEvaluator.check_trajectories(trajs)
         return trajs
 
     @staticmethod
-    def get_joint_traj_in_single_agent_stable_baselines_format(trajs, encoding_fn, save=False, filename=None):
-        """
-        This requires splitting each trajectory into two, one for each action in the
-        joint action.
-        """
-        trajs = copy.deepcopy(trajs)
-        sb_traj_dict_keys = ["actions", "obs", "rewards", "episode_starts", "episode_returns"]
-        sb_trajs_dict = { k:[] for k in sb_traj_dict_keys }
-
-        AgentEvaluator.add_observations_to_trajs_in_metadata(trajs, encoding_fn)
-
-        for traj_idx in range(len(trajs["ep_lengths"])):
-            # Extract single-agent trajectory for each agent
-            # for agent_idx in range(2):
-            agent_idx = trajs["metadatas"]["ep_agent_idxs"][traj_idx]
-                
-            # Getting only actions for current agent index, and processing them to an array 
-            # with shape (1, )
-            processed_agent_actions = [[Action.ACTION_TO_INDEX[j_a[agent_idx]]] for j_a in trajs["ep_actions"][traj_idx]]
-            sb_trajs_dict["actions"].extend(processed_agent_actions)
-
-            agent_obs = [both_agent_obs[agent_idx] for both_agent_obs in trajs["metadatas"]["ep_obs_for_both_agents"][traj_idx]]
-            sb_trajs_dict["obs"].extend(agent_obs)
-
-            sb_trajs_dict["rewards"].extend(trajs["ep_rewards"][traj_idx])
-
-            # Converting episode dones to episode starts
-            traj_starts = [1 if i == 0 else 0 for i in range(trajs["ep_lengths"][traj_idx])]
-            sb_trajs_dict["episode_starts"].extend(traj_starts)
-            sb_trajs_dict["episode_returns"].append(trajs["ep_returns"][traj_idx])
-
-        sb_trajs_dict = { k:np.array(v) for k, v in sb_trajs_dict.items() }
-
-        if save:
-            assert filename is not None
-            np.savez(filename, **sb_trajs_dict)
-
-        return sb_trajs_dict
-
-    @staticmethod
-    def save_traj_as_json(trajectory, filename):
-        """Saves the `idx`th trajectory as a list of state action pairs"""
-        assert set(OvercookedEnv.DEFAULT_TRAJ_KEYS) == set(trajectory.keys()), "{} vs\n{}".format(OvercookedEnv.DEFAULT_TRAJ_KEYS, trajectory.keys())
-        AgentEvaluator.check_trajectories(trajectory)
-        trajectory = AgentEvaluator.make_trajectories_json_serializable(trajectory)
-        save_as_json(trajectory, filename)
+    def save_traj_as_json(trajectories, filename):
+        assert set(OvercookedEnv.DEFAULT_TRAJ_KEYS) == set(trajectories.keys()), "{} vs\n{}".format(OvercookedEnv.DEFAULT_TRAJ_KEYS, trajectories.keys())
+        AgentEvaluator.check_trajectories(trajectories)
+        trajectories = AgentEvaluator.make_trajectories_json_serializable(trajectories)
+        save_as_json(trajectories, filename)
 
     @staticmethod
     def make_trajectories_json_serializable(trajectories):
@@ -302,21 +270,37 @@ class AgentEvaluator(object):
         dict_traj['ep_dones'] = [list(lst) for lst in dict_traj['ep_dones']]
         dict_traj['ep_returns'] = [int(val) for val in dict_traj['ep_returns']]
         dict_traj['ep_lengths'] = [int(val) for val in dict_traj['ep_lengths']]
-
-        # NOTE: Currently saving to JSON does not support ep_infos (due to nested np.arrays) or metadata
-        del dict_traj['ep_infos']
+        # NOTE: Currently saving to JSON does not support metadata
+        dict_traj['ep_infos'] = json.loads(json.dumps(dict_traj['ep_infos'], cls=NumpyArrayEncoder))
         del dict_traj['metadatas']
         return dict_traj
 
     @staticmethod
     def load_traj_from_json(filename):
+        AgentEvaluator._configure_recipe_if_needed()
         traj_dict = load_from_json(filename)
+        return AgentEvaluator.load_traj_from_json_obj(traj_dict)
+
+    @staticmethod
+    def load_traj_from_json_obj(obj):
+        # currently ep_infos is not changed back to numpy arrays/tuples from lists
+        traj_dict = copy.deepcopy(obj)
         traj_dict["ep_states"] = [[OvercookedState.from_dict(ob) for ob in curr_ep_obs] for curr_ep_obs in traj_dict["ep_states"]]
         traj_dict["ep_actions"] = [[tuple(tuple(a) if type(a) is list else a for a in j_a) for j_a in ep_acts] for ep_acts in traj_dict["ep_actions"]]
         return traj_dict
+    
+    @staticmethod
+    def _configure_recipe_if_needed(config={}):
+        """
+        method that configures recipe to avoid ValueError when recipe is created before configuring class
+        recipe is created on reading trajectory because recipe is part of the order that is part of the state that is part of the treajectory
+        """
+        if not Recipe._configured:
+            print("Configuring recipe from AgentEvaluator class with config:", config)
+            Recipe.configure(config)
 
     ############################
-    # TRAJ MANINPULATION UTILS #
+    # TRAJ MANIPULATION UTILS #
     ############################
     # TODO: add more documentation!
 
@@ -374,56 +358,26 @@ class AgentEvaluator(object):
             return "ep_obs_for_both_agents", obs_metadata
         return AgentEvaluator.add_metadata_to_traj(trajs, metadata_fn, ["ep_states"])
 
-
-    ### VIZUALIZATION METHODS ###
-
-    @staticmethod
-    def interactive_from_traj(trajectories, traj_idx=0, nested_keys_to_print=[]):
-        """
-        Displays ith trajectory of trajectories (in standard format) 
-        interactively in a Jupyter notebook.
-
-        keys_to_print is a list of keys of info to be printed. By default
-        states and actions (corresponding to the previous timestep will be printed)
-        will be printed.
-        """
-        from ipywidgets import widgets, interactive_output
-
-        states = trajectories["ep_states"][traj_idx]
-        joint_actions = trajectories["ep_actions"][traj_idx]
-        
-        other_info = {}
-        for nested_k in nested_keys_to_print:
-            inner_data = trajectories
-            for k in nested_k:
-                inner_data = inner_data[k]
-            inner_data = inner_data[traj_idx]
-            
-            assert np.array(inner_data).shape == np.array(states).shape, "{} vs {}".format(np.array(inner_data).shape, np.array(states).shape)
-            other_info[k] = inner_data
-
-        cumulative_rewards = cumulative_rewards_from_rew_list(trajectories["ep_rewards"][traj_idx])
-        mdp_params = trajectories["mdp_params"][traj_idx]
-        env_params = trajectories["env_params"][traj_idx]
-        env = AgentEvaluator.from_mdp_params(mdp_params, env_params=env_params).env
-
-        def update(t = 1.0):
-            traj_timestep = int(t)
-            env.state = states[traj_timestep]
-            joint_action = joint_actions[traj_timestep - 1] if traj_timestep > 0 else (Action.STAY, Action.STAY)
-            print(env)
-            print("Joint Action: {} \t Score: {}".format(Action.joint_action_to_char(joint_action), cumulative_rewards[t]))
-
-            for k, data in other_info.items():
-                print("{}: {}".format(k, data[traj_timestep]))
-
-        t = widgets.IntSlider(min=0, max=len(states) - 1, step=1, value=0)
-        out = interactive_output(update, {'t': t})
-        display(out, t)
-
     # EVENTS VISUALIZATION METHODS #
-    
+        
     @staticmethod
-    def events_visualization(trajs, traj_index):
-        # TODO
-        pass
+    def events_visualization(trajs, traj_index=0, ipython=False, chart_settings=None):
+        """
+        Displays chart with visualization of events (when items pickups happened etc.)
+        ipython - chooses between opening chart
+        in default browser or below ipython cell (for ipython=True)
+        chart_settings - json with various chart settings that overwrites default ones
+        """
+        settings = DEFAULT_EVENT_CHART_SETTINGS.copy()
+        settings.update(chart_settings or {})
+
+        if settings.get("show_cumulative_data"):
+            events = extract_events(trajs, traj_index, settings["cumulative_events_description"])
+        else: # no need to add cumulative data that won't be shown
+            events = extract_events(trajs, traj_index)
+
+        html = create_chart_html(events, settings)
+        if ipython:
+            run_html_in_ipython(html)
+        else:
+            run_html_in_web(html)

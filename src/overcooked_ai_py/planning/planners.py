@@ -65,7 +65,7 @@ class MotionPlanner(object):
     @staticmethod
     def from_pickle_or_compute(mdp, counter_goals, custom_filename=None, force_compute=False, info=False):
         assert isinstance(mdp, OvercookedGridworld)
-
+        counter_goals = [tuple(x) for x in counter_goals]
         filename = custom_filename if custom_filename is not None else mdp.layout_name + "_mp.pkl"
 
         if force_compute:
@@ -74,8 +74,12 @@ class MotionPlanner(object):
         try:
             mp = MotionPlanner.from_file(filename)
 
-            if mp.counter_goals != counter_goals or mp.mdp != mdp:
+            if mp.counter_goals != counter_goals or not mdp.ids_and_reward_shaping_independent_equal(mp.mdp):
                 print("motion planner with different counter goal or mdp found, computing from scratch")
+                if mp.counter_goals != counter_goals:
+                    print("different counter goals", mp.counter_goals, counter_goals)
+                if not mdp.ids_and_reward_shaping_independent_equal(mp.mdp):
+                    print("different mdps")
                 return MotionPlanner.compute_mp(filename, mdp, counter_goals)
 
         except (FileNotFoundError, ModuleNotFoundError, EOFError, AttributeError) as e:
@@ -345,12 +349,13 @@ class JointMotionPlanner(object):
 
     def __init__(self, mdp, params, debug=False):
         self.mdp = mdp
-
+        
         # Whether starting orientations should be accounted for
         # when solving all motion problems 
         # (increases number of plans by a factor of 4)
         # but removes additional fudge factor <= 1 for each
         # joint motion plan
+        self.params = params
         self.start_orientations = params["start_orientations"]
 
         # Enable both agents to have the same motion goal
@@ -674,7 +679,7 @@ class JointMotionPlanner(object):
         # (otherwise Environment will terminate)
         from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
         dummy_state = OvercookedState.from_players_pos_and_or(joint_start_state, all_orders=self.mdp.start_all_orders)
-        env = OvercookedEnv.from_mdp(self.mdp, horizon=200) # Plans should be shorter than 200 timesteps, or something is likely wrong
+        env = OvercookedEnv.from_mdp(self.mdp, horizon=200, mlam_params=self.params) # Plans should be shorter than 200 timesteps, or something is likely wrong
         successor_state, is_done = env.execute_plan(dummy_state, joint_action_plan)
         assert not is_done
         return successor_state.players_pos_and_or
@@ -771,12 +776,13 @@ class MediumLevelActionManager(object):
 
     def __init__(self, mdp, mlam_params):
         self.mdp = mdp
-        
         self.params = mlam_params
         self.wait_allowed = mlam_params['wait_allowed']
-        self.counter_drop = mlam_params["counter_drop"]
-        self.counter_pickup = mlam_params["counter_pickup"]
-        
+        self.counter_drop = [tuple(elem) for elem in mlam_params["counter_drop"]]
+        self.counter_pickup = [tuple(elem) for elem in mlam_params["counter_pickup"]]
+        # used to make agent mlam not see certain feature/counter;
+        #  can be used for make irrational agent or pedagogical one
+        self.ignored_goals = set([tuple(elem) for elem in mlam_params.get("ignored_goals", [])])
         self.joint_motion_planner = JointMotionPlanner(mdp, mlam_params)
         self.motion_planner = self.joint_motion_planner.motion_planner
 
@@ -791,7 +797,11 @@ class MediumLevelActionManager(object):
     @staticmethod
     def from_pickle_or_compute(mdp, mlam_params, custom_filename=None, force_compute=False, info=True):
         assert isinstance(mdp, OvercookedGridworld)
-
+        mlam_params["counter_drop"] = [tuple(elem) for elem in mlam_params["counter_drop"]]
+        mlam_params["counter_pickup"] = [tuple(elem) for elem in mlam_params["counter_pickup"]]
+        mlam_params["counter_goals"] = [tuple(elem) for elem in mlam_params["counter_goals"]]
+        mlam_params["ignored_goals"] = [tuple(elem) for elem in mlam_params.get("ignored_goals", [])]
+    
         filename = custom_filename if custom_filename is not None else mdp.layout_name + "_am.pkl"
 
         if force_compute:
@@ -799,9 +809,12 @@ class MediumLevelActionManager(object):
 
         try:
             mlam = MediumLevelActionManager.from_file(filename)
-
-            if mlam.params != mlam_params or mlam.mdp != mdp:
+            if mlam.params != mlam_params or not mdp.ids_and_reward_shaping_independent_equal(mlam.mdp):
                 print("medium level action manager with different params or mdp found, computing from scratch")
+                if mlam.params != mlam_params:
+                    print("different mlam_params", mlam.params, mlam_params)
+                if not mdp.ids_and_reward_shaping_independent_equal(mlam.mdp):
+                    print("different mdps")
                 return MediumLevelActionManager.compute_mlam(filename, mdp, mlam_params)
 
         except (FileNotFoundError, ModuleNotFoundError, EOFError, AttributeError) as e:
@@ -822,6 +835,9 @@ class MediumLevelActionManager(object):
         mlam.save_to_file(final_filepath)
         return mlam
 
+    def remove_ignored_goals_from_locations(self, locations):
+        return [loc for loc in locations if not loc in self.ignored_goals]
+    
     def joint_ml_actions(self, state):
         """Determine all possible joint medium level actions for a certain state"""
         agent1_actions, agent2_actions = tuple(self.get_medium_level_actions(state, player) for player in state.players)
@@ -964,7 +980,9 @@ class MediumLevelActionManager(object):
     def go_to_closest_feature_actions(self, player):
         feature_locations = self.mdp.get_onion_dispenser_locations() + self.mdp.get_tomato_dispenser_locations() + \
                             self.mdp.get_pot_locations() + self.mdp.get_dish_dispenser_locations()
+        feature_locations = self.remove_ignored_goals_from_locations(feature_locations)
         closest_feature_pos = self.motion_planner.min_cost_to_feature(player.pos_and_or, feature_locations, with_argmin=True)[1]
+        
         return self._get_ml_actions_for_positions([closest_feature_pos])
 
     def go_to_closest_feature_or_counter_to_goal(self, goal_pos_and_or, goal_location):
@@ -973,6 +991,7 @@ class MediumLevelActionManager(object):
                                     self.mdp.get_tomato_dispenser_locations() + self.mdp.get_pot_locations() + \
                                     self.mdp.get_dish_dispenser_locations() + self.counter_drop
         valid_locations.remove(goal_location)
+        valid_locations = self.remove_ignored_goals_from_locations(valid_locations)
         closest_non_goal_feature_pos = self.motion_planner.min_cost_to_feature(
                                             goal_pos_and_or, valid_locations, with_argmin=True)[1]
         return self._get_ml_actions_for_positions([closest_non_goal_feature_pos])
@@ -988,6 +1007,7 @@ class MediumLevelActionManager(object):
             positions_list (list): list of target terrain feature positions
         """
         possible_motion_goals = []
+        positions_list = self.remove_ignored_goals_from_locations(positions_list)
         for pos in positions_list:
             # All possible ways to reach the target feature
             for motion_goal in self.joint_motion_planner.motion_planner.motion_goals_for_pos[pos]:
